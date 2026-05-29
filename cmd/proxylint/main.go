@@ -85,8 +85,8 @@ type Options struct {
 	Concurrency int
 	ProbeURL    string
 	CoreMode    CoreMode
-	XrayBin    string
-	SingBoxBin string
+	XrayBin     string
+	SingBoxBin  string
 }
 
 func main() {
