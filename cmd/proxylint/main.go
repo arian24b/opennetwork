@@ -37,22 +37,26 @@ const (
 )
 
 type Proxy struct {
-	Raw      string
-	Kind     ProxyKind
-	Name     string
-	Host     string
-	Port     int
-	UUID     string
-	Password string
-	Method   string
-	Network  string
-	TLS      bool
-	SNI      string
-	Path     string
-	HostHdr  string
-	Remark   string
-	Secret   string
-	Security string
+	Raw       string
+	Kind      ProxyKind
+	Name      string
+	Host      string
+	Port      int
+	UUID      string
+	Password  string
+	Method    string
+	Network   string
+	Mode      string
+	TLS       bool
+	SNI       string
+	Path      string
+	HostHdr   string
+	Remark    string
+	Secret    string
+	Security  string
+	PublicKey string
+	ShortID   string
+	SpiderX   string
 }
 
 type CheckResult struct {
@@ -192,7 +196,9 @@ func isValidCoreMode(m CoreMode) bool {
 func loadInputs(opt Options) ([]string, error) {
 	items := make([]string, 0)
 	if strings.TrimSpace(opt.SingleProxy) != "" {
-		items = append(items, strings.TrimSpace(opt.SingleProxy))
+		if v := normalizeInputLine(opt.SingleProxy); v != "" {
+			items = append(items, v)
+		}
 	}
 	if strings.TrimSpace(opt.InputFile) == "" {
 		return uniq(items), nil
@@ -203,13 +209,45 @@ func loadInputs(opt Options) ([]string, error) {
 	}
 	lines := strings.Split(string(b), "\n")
 	for _, ln := range lines {
-		v := strings.TrimSpace(ln)
+		v := normalizeInputLine(ln)
 		if v == "" || strings.HasPrefix(v, "#") {
 			continue
 		}
 		items = append(items, v)
 	}
 	return uniq(items), nil
+}
+
+func normalizeInputLine(in string) string {
+	v := strings.TrimSpace(in)
+	if v == "" {
+		return ""
+	}
+
+	lower := strings.ToLower(v)
+	if i := strings.Index(lower, "href="); i >= 0 {
+		rest := strings.TrimSpace(v[i+len("href="):])
+		if len(rest) > 1 && (rest[0] == '\'' || rest[0] == '"') {
+			q := rest[0]
+			rest = rest[1:]
+			if j := strings.IndexByte(rest, q); j >= 0 {
+				v = rest[:j]
+			}
+		}
+	}
+
+	v = strings.TrimSpace(v)
+	v = strings.Trim(v, "`\"'")
+	if i := strings.Index(v, "```"); i >= 0 {
+		v = strings.TrimSpace(v[:i])
+	}
+	v = strings.TrimSpace(v)
+
+	if strings.HasPrefix(v, "https://t.me/proxy?") || strings.HasPrefix(v, "tg://proxy?") {
+		v = strings.TrimRight(v, ")")
+	}
+
+	return strings.TrimSpace(v)
 }
 
 func uniq(in []string) []string {
@@ -226,11 +264,15 @@ func uniq(in []string) []string {
 }
 
 func parseProxy(raw string) (Proxy, error) {
+	raw = normalizeInputLine(raw)
 	if strings.HasPrefix(raw, "mtproto://") {
 		return parseMTProtoURI(raw)
 	}
 	if strings.HasPrefix(raw, "https://t.me/proxy?") || strings.HasPrefix(raw, "tg://proxy?") {
 		return parseTelegram(raw)
+	}
+	if strings.HasPrefix(raw, "vmess://") {
+		return parseVMess(raw, nil)
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -314,18 +356,22 @@ func parseVLESS(raw string, u *url.URL) (Proxy, error) {
 	q := u.Query()
 	remark, _ := url.QueryUnescape(strings.TrimPrefix(u.Fragment, "#"))
 	return Proxy{
-		Raw:      raw,
-		Kind:     KindVLESS,
-		Host:     h,
-		Port:     pi,
-		UUID:     u.User.Username(),
-		TLS:      q.Get("security") == "tls" || q.Get("security") == "reality",
-		SNI:      q.Get("sni"),
-		Network:  defaultStr(q.Get("type"), "tcp"),
-		Path:     q.Get("path"),
-		HostHdr:  q.Get("host"),
-		Remark:   remark,
-		Security: q.Get("security"),
+		Raw:       raw,
+		Kind:      KindVLESS,
+		Host:      h,
+		Port:      pi,
+		UUID:      u.User.Username(),
+		TLS:       q.Get("security") == "tls" || q.Get("security") == "reality",
+		SNI:       q.Get("sni"),
+		Network:   defaultStr(q.Get("type"), "tcp"),
+		Mode:      q.Get("mode"),
+		Path:      q.Get("path"),
+		HostHdr:   q.Get("host"),
+		Remark:    remark,
+		Security:  q.Get("security"),
+		PublicKey: q.Get("pbk"),
+		ShortID:   q.Get("sid"),
+		SpiderX:   q.Get("spx"),
 	}, nil
 }
 
@@ -345,13 +391,19 @@ func parseTrojan(raw string, u *url.URL) (Proxy, error) {
 		TLS:      true,
 		SNI:      q.Get("sni"),
 		Network:  defaultStr(q.Get("type"), "tcp"),
+		Mode:     q.Get("mode"),
 		Path:     q.Get("path"),
 		HostHdr:  q.Get("host"),
 	}, nil
 }
 
-func parseVMess(raw string, u *url.URL) (Proxy, error) {
+func parseVMess(raw string, _ *url.URL) (Proxy, error) {
 	enc := strings.TrimPrefix(raw, "vmess://")
+	if i := strings.IndexAny(enc, "#?"); i >= 0 {
+		enc = enc[:i]
+	}
+	enc = strings.TrimRight(enc, "`")
+	enc = strings.TrimSpace(enc)
 	b, err := base64.RawStdEncoding.DecodeString(enc)
 	if err != nil {
 		b, err = base64.StdEncoding.DecodeString(enc)
@@ -359,36 +411,72 @@ func parseVMess(raw string, u *url.URL) (Proxy, error) {
 			return Proxy{}, fmt.Errorf("invalid vmess payload")
 		}
 	}
-	var m map[string]string
-	if err := json.Unmarshal(b, &m); err != nil {
+	return parseVMessPayload(raw, b)
+}
+
+func parseVMessPayload(raw string, payload []byte) (Proxy, error) {
+	var m map[string]interface{}
+	if err := json.Unmarshal(payload, &m); err != nil {
 		return Proxy{}, err
 	}
-	pi, _ := strconv.Atoi(m["port"])
+	pi, _ := strconv.Atoi(vmessVal(m, "port"))
 	if pi == 0 {
-		pi, _ = strconv.Atoi(m["addport"])
+		pi, _ = strconv.Atoi(vmessVal(m, "addport"))
 	}
 	return Proxy{
 		Raw:      raw,
 		Kind:     KindVMess,
-		Host:     m["add"],
+		Host:     vmessVal(m, "add"),
 		Port:     pi,
-		UUID:     m["id"],
-		TLS:      m["tls"] == "tls",
-		SNI:      m["sni"],
-		Network:  defaultStr(m["net"], "tcp"),
-		Path:     m["path"],
-		HostHdr:  m["host"],
-		Security: m["security"],
+		UUID:     vmessVal(m, "id"),
+		TLS:      strings.EqualFold(vmessVal(m, "tls"), "tls"),
+		SNI:      vmessVal(m, "sni"),
+		Network:  defaultStr(vmessVal(m, "net"), "tcp"),
+		Path:     vmessVal(m, "path"),
+		HostHdr:  vmessVal(m, "host"),
+		Security: vmessVal(m, "security"),
 	}, nil
+}
+
+func vmessVal(m map[string]interface{}, key string) string {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return ""
+	}
+	switch x := v.(type) {
+	case string:
+		return x
+	case float64:
+		return strconv.FormatInt(int64(x), 10)
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprint(x)
+	}
 }
 
 func parseSS(raw string, u *url.URL) (Proxy, error) {
 	content := strings.TrimPrefix(raw, "ss://")
-	part := content
-	if at := strings.LastIndex(content, "@"); at == -1 {
-		decoded, err := base64DecodeLenient(content)
+	if i := strings.Index(content, "#"); i >= 0 {
+		content = content[:i]
+	}
+	main := content
+	if i := strings.Index(main, "?"); i >= 0 {
+		main = main[:i]
+	}
+	part := main
+	if at := strings.LastIndex(main, "@"); at == -1 {
+		decoded, err := base64DecodeLenient(main)
 		if err != nil {
 			return Proxy{}, err
+		}
+		if strings.HasPrefix(strings.TrimSpace(decoded), "{") {
+			if p, err := parseVMessPayload(raw, []byte(decoded)); err == nil {
+				return p, nil
+			}
 		}
 		part = decoded
 	}
@@ -401,9 +489,6 @@ func parseSS(raw string, u *url.URL) (Proxy, error) {
 		return Proxy{}, errors.New("invalid ss format")
 	}
 
-	if strings.Contains(hostport, "#") {
-		hostport = strings.SplitN(hostport, "#", 2)[0]
-	}
 	if strings.Contains(hostport, "?") {
 		hostport = strings.SplitN(hostport, "?", 2)[0]
 	}
@@ -416,8 +501,44 @@ func parseSS(raw string, u *url.URL) (Proxy, error) {
 		sp := strings.SplitN(userinfo, ":", 2)
 		return Proxy{Raw: raw, Kind: KindSS, Host: h, Port: pi, Method: sp[0], Password: sp[1]}, nil
 	}
+	if u != nil {
+		q := u.Query()
+		method := q.Get("method")
+		if method == "" {
+			method = q.Get("encryption")
+		}
+		if method != "" {
+			return Proxy{Raw: raw, Kind: KindSS, Host: h, Port: pi, Method: method, Password: userinfo}, nil
+		}
+		return Proxy{
+			Raw:      raw,
+			Kind:     KindTrojan,
+			Host:     h,
+			Port:     pi,
+			Password: userinfo,
+			TLS:      true,
+			SNI:      q.Get("sni"),
+			Network:  defaultStr(q.Get("type"), "tcp"),
+			Mode:     q.Get("mode"),
+			Path:     q.Get("path"),
+			HostHdr:  q.Get("host"),
+		}, nil
+	}
+	if unesc, err := url.QueryUnescape(userinfo); err == nil {
+		userinfo = unesc
+	}
 	decoded, err := base64DecodeLenient(userinfo)
 	if err != nil {
+		if u != nil {
+			q := u.Query()
+			method := q.Get("method")
+			if method == "" {
+				method = q.Get("encryption")
+			}
+			if method != "" {
+				return Proxy{Raw: raw, Kind: KindSS, Host: h, Port: pi, Method: method, Password: userinfo}, nil
+			}
+		}
 		return Proxy{}, err
 	}
 	sp := strings.SplitN(decoded, ":", 2)
@@ -728,8 +849,16 @@ func runSingleCoreCheck(p Proxy, core string, opt Options) CheckResult {
 	}
 
 	errBuf := &strings.Builder{}
-	go io.Copy(io.Discard, stdout)
-	go io.Copy(errBuf, stderr)
+	var pipeWG sync.WaitGroup
+	pipeWG.Add(2)
+	go func() {
+		defer pipeWG.Done()
+		_, _ = io.Copy(io.Discard, stdout)
+	}()
+	go func() {
+		defer pipeWG.Done()
+		_, _ = io.Copy(errBuf, stderr)
+	}()
 
 	time.Sleep(650 * time.Millisecond)
 	start := time.Now()
@@ -738,6 +867,7 @@ func runSingleCoreCheck(p Proxy, core string, opt Options) CheckResult {
 
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
+	pipeWG.Wait()
 
 	if err != nil {
 		msg := err.Error()
@@ -808,7 +938,23 @@ func xrayOutboundFor(p Proxy) (map[string]any, error) {
 	switch p.Kind {
 	case KindVLESS:
 		stream := map[string]any{"network": p.Network}
-		if p.TLS {
+		if p.Security == "reality" {
+			stream["security"] = "reality"
+			realityCfg := map[string]any{}
+			if p.SNI != "" {
+				realityCfg["serverName"] = p.SNI
+			}
+			if p.PublicKey != "" {
+				realityCfg["publicKey"] = p.PublicKey
+			}
+			if p.ShortID != "" {
+				realityCfg["shortId"] = p.ShortID
+			}
+			if p.SpiderX != "" {
+				realityCfg["spiderX"] = p.SpiderX
+			}
+			stream["realitySettings"] = realityCfg
+		} else if p.TLS {
 			stream["security"] = "tls"
 			tlsCfg := map[string]any{}
 			if p.SNI != "" {
@@ -818,6 +964,16 @@ func xrayOutboundFor(p Proxy) (map[string]any, error) {
 		}
 		if p.Network == "ws" {
 			stream["wsSettings"] = map[string]any{"path": defaultStr(p.Path, "/"), "headers": map[string]any{"Host": p.HostHdr}}
+		}
+		if p.Network == "xhttp" {
+			xhttpCfg := map[string]any{"path": defaultStr(p.Path, "/")}
+			if p.HostHdr != "" {
+				xhttpCfg["host"] = p.HostHdr
+			}
+			if p.Mode != "" {
+				xhttpCfg["mode"] = p.Mode
+			}
+			stream["xhttpSettings"] = xhttpCfg
 		}
 		return map[string]any{
 			"tag":            "proxy",
@@ -829,6 +985,16 @@ func xrayOutboundFor(p Proxy) (map[string]any, error) {
 		stream := map[string]any{"network": p.Network, "security": "tls", "tlsSettings": map[string]any{"serverName": p.SNI}}
 		if p.Network == "ws" {
 			stream["wsSettings"] = map[string]any{"path": defaultStr(p.Path, "/"), "headers": map[string]any{"Host": p.HostHdr}}
+		}
+		if p.Network == "xhttp" {
+			xhttpCfg := map[string]any{"path": defaultStr(p.Path, "/")}
+			if p.HostHdr != "" {
+				xhttpCfg["host"] = p.HostHdr
+			}
+			if p.Mode != "" {
+				xhttpCfg["mode"] = p.Mode
+			}
+			stream["xhttpSettings"] = xhttpCfg
 		}
 		return map[string]any{
 			"tag":            "proxy",
@@ -846,6 +1012,16 @@ func xrayOutboundFor(p Proxy) (map[string]any, error) {
 		}
 		if p.Network == "ws" {
 			stream["wsSettings"] = map[string]any{"path": defaultStr(p.Path, "/"), "headers": map[string]any{"Host": p.HostHdr}}
+		}
+		if p.Network == "xhttp" {
+			xhttpCfg := map[string]any{"path": defaultStr(p.Path, "/")}
+			if p.HostHdr != "" {
+				xhttpCfg["host"] = p.HostHdr
+			}
+			if p.Mode != "" {
+				xhttpCfg["mode"] = p.Mode
+			}
+			stream["xhttpSettings"] = xhttpCfg
 		}
 		return map[string]any{
 			"tag":            "proxy",
@@ -893,12 +1069,35 @@ func buildSingBoxConfig(p Proxy, localPort int) ([]byte, error) {
 func singboxOutboundFor(p Proxy) (map[string]any, error) {
 	switch p.Kind {
 	case KindVLESS:
-		o := map[string]any{"type": "vless", "tag": "proxy", "server": p.Host, "server_port": p.Port, "uuid": p.UUID, "tls": map[string]any{"enabled": p.TLS}}
+		tlsCfg := map[string]any{"enabled": p.TLS}
+		if p.Security == "reality" {
+			tlsCfg["enabled"] = true
+			realityCfg := map[string]any{"enabled": true}
+			if p.PublicKey != "" {
+				realityCfg["public_key"] = p.PublicKey
+			}
+			if p.ShortID != "" {
+				realityCfg["short_id"] = p.ShortID
+			}
+			tlsCfg["reality"] = realityCfg
+		}
+		o := map[string]any{"type": "vless", "tag": "proxy", "server": p.Host, "server_port": p.Port, "uuid": p.UUID, "tls": tlsCfg}
 		if p.SNI != "" {
 			o["tls"].(map[string]any)["server_name"] = p.SNI
 		}
 		if p.Network == "ws" {
 			o["transport"] = map[string]any{"type": "ws", "path": defaultStr(p.Path, "/"), "headers": map[string]any{"Host": p.HostHdr}}
+		}
+		if p.Network == "xhttp" {
+			h := []string{}
+			if p.HostHdr != "" {
+				h = append(h, p.HostHdr)
+			}
+			transport := map[string]any{"type": "http", "path": defaultStr(p.Path, "/")}
+			if len(h) > 0 {
+				transport["host"] = h
+			}
+			o["transport"] = transport
 		}
 		return o, nil
 	case KindTrojan:
@@ -909,6 +1108,17 @@ func singboxOutboundFor(p Proxy) (map[string]any, error) {
 		if p.Network == "ws" {
 			o["transport"] = map[string]any{"type": "ws", "path": defaultStr(p.Path, "/"), "headers": map[string]any{"Host": p.HostHdr}}
 		}
+		if p.Network == "xhttp" {
+			h := []string{}
+			if p.HostHdr != "" {
+				h = append(h, p.HostHdr)
+			}
+			transport := map[string]any{"type": "http", "path": defaultStr(p.Path, "/")}
+			if len(h) > 0 {
+				transport["host"] = h
+			}
+			o["transport"] = transport
+		}
 		return o, nil
 	case KindVMess:
 		o := map[string]any{"type": "vmess", "tag": "proxy", "server": p.Host, "server_port": p.Port, "uuid": p.UUID, "security": defaultStr(p.Security, "auto"), "tls": map[string]any{"enabled": p.TLS}}
@@ -917,6 +1127,17 @@ func singboxOutboundFor(p Proxy) (map[string]any, error) {
 		}
 		if p.Network == "ws" {
 			o["transport"] = map[string]any{"type": "ws", "path": defaultStr(p.Path, "/"), "headers": map[string]any{"Host": p.HostHdr}}
+		}
+		if p.Network == "xhttp" {
+			h := []string{}
+			if p.HostHdr != "" {
+				h = append(h, p.HostHdr)
+			}
+			transport := map[string]any{"type": "http", "path": defaultStr(p.Path, "/")}
+			if len(h) > 0 {
+				transport["host"] = h
+			}
+			o["transport"] = transport
 		}
 		return o, nil
 	case KindSS:
@@ -969,15 +1190,6 @@ func writeOutputs(results []CheckResult, opt Options) {
 			if _, ok := validSet[failed[i]]; ok {
 				failed = append(failed[:i], failed[i+1:]...)
 				i--
-			}
-		}
-	} else {
-		for _, r := range results {
-			if !r.Connected {
-				if _, seen := failedSet[r.Raw]; !seen {
-					failedSet[r.Raw] = struct{}{}
-					failed = append(failed, r.Raw)
-				}
 			}
 		}
 	}

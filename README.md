@@ -92,6 +92,35 @@ File with Telegram SOCKS5 and MTProto proxies:
 ./proxylint check --in tg_proxies.txt --out tg_valid.txt --timeout 15s
 ```
 
+## Validated run data
+
+The command below was run against `/home/ubuntu/Downloads/Telegram Desktop/proxies.txt` with Xray core:
+
+```bash
+./proxylint check \
+  --in "/home/ubuntu/Downloads/Telegram Desktop/proxies.txt" \
+  --core xray \
+  --xray-bin "/tmp/opencode/xray/xray" \
+  --timeout 4s \
+  --retries 0 \
+  --concurrency 40 \
+  --out "/tmp/opencode/valid.txt" \
+  --failed "/tmp/opencode/failed.txt" \
+  --json "/tmp/opencode/report.json"
+```
+
+Observed summary:
+
+```text
+done: total=2229 parsed=2227 parse_fail=2 passed=105 failed=2122
+```
+
+Generated files from that run:
+
+- `/tmp/opencode/valid.txt` -> 105 lines
+- `/tmp/opencode/failed.txt` -> 2122 lines
+- `/tmp/opencode/report.json` -> full JSON report for 2227 parsed entries
+
 ## Output format
 
 Valid proxies are written to `--out` (one URL per line).  
